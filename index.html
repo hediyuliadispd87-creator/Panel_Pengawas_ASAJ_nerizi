@@ -204,7 +204,6 @@
 
   .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 
-  /* Instance badge di header */
   .instance-badge {
     display: flex; align-items: center; gap: 6px;
     background: var(--blue-dim);
@@ -1025,7 +1024,6 @@
   ══════════════════════════════════════════ */
   function pilihInstance(num) {
     selectedInstance = num;
-    // Update UI selector
     document.querySelectorAll('.instance-btn').forEach(btn => {
       btn.classList.toggle('active', parseInt(btn.dataset.instance) === num);
     });
@@ -1041,11 +1039,9 @@
   }
 
   function gantiInstance() {
-    // Matikan listener lama
     if (dbListener && db) {
       try { db.ref('ujian/peserta').off('value', dbListener); } catch(e) {}
     }
-    // Reset state
     Object.keys(pesertaData).forEach(k => delete pesertaData[k]);
     logHistory.length = 0;
     resetFilter();
@@ -1053,11 +1049,9 @@
     updateStats();
     clearLog();
 
-    // Kembali ke selector
     document.getElementById('appContainer').style.display = 'none';
     document.getElementById('selectorOverlay').style.display = 'flex';
 
-    // Reset pilihan
     document.querySelectorAll('.instance-btn').forEach(btn => btn.classList.remove('active'));
     document.getElementById('btnMasuk').disabled = true;
     selectedInstance = null;
@@ -1069,7 +1063,6 @@
   function initFirebase(instanceNum) {
     try {
       const cfg = FIREBASE_CONFIGS[instanceNum];
-      // Hapus app Firebase sebelumnya jika ada
       if (firebaseApp) {
         try { firebaseApp.delete(); } catch(e) {}
       }
@@ -1086,13 +1079,34 @@
     const ref = db.ref('ujian/peserta');
     dbListener = ref.on('value', (snapshot) => {
       const data = snapshot.val() || {};
+
       Object.keys(data).forEach(id => {
-        const prev = pesertaData[id];
         const curr = data[id];
-        if (prev && prev.status !== curr.status) addNotification(curr, curr.status);
+
+        // ── BUG FIX 1: Skip peserta yang tidak punya nama DAN tidak punya ID ──
+        // Data sampah (node kosong atau hanya berisi field non-peserta) diabaikan
+        if (!curr || (!curr.nama && !curr.id)) return;
+
+        const prev = pesertaData[id];
+
+        // ── BUG FIX 2: Cek perubahan status dengan benar ──
+        // Hanya trigger notifikasi jika:
+        // - peserta sudah ada sebelumnya (bukan data baru saat load awal)
+        // - statusnya benar-benar berubah
+        // - status sebelumnya valid (bukan undefined dari load pertama)
+        if (prev && prev.status !== undefined && prev.status !== curr.status) {
+          addNotification(curr, curr.status);
+        }
+
+        // Simpan data SETELAH cek, bukan sebelumnya
         pesertaData[id] = curr;
       });
-      Object.keys(pesertaData).forEach(id => { if (!data[id]) delete pesertaData[id]; });
+
+      // Hapus peserta yang sudah tidak ada di Firebase
+      Object.keys(pesertaData).forEach(id => {
+        if (!data[id]) delete pesertaData[id];
+      });
+
       renderFilterChips();
       renderTable();
       updateStats();
@@ -1103,7 +1117,8 @@
      HELPERS
   ══════════════════════════════════════════ */
   function getInitials(name) {
-    return name ? name.split(' ').map(w => w[0]).join('').substring(0,2).toUpperCase() : '?';
+    if (!name || !name.trim()) return '?';
+    return name.trim().split(/\s+/).map(w => w[0]).join('').substring(0, 2).toUpperCase();
   }
 
   function getAvatarColor(id) {
@@ -1254,7 +1269,15 @@
 
     tbody.innerHTML = filteredList.map(p => {
       const color  = getAvatarColor(p.id || p.nama || '?');
-      const v      = p.violations || 0;
+
+      // ── BUG FIX 3: Parse violations sebagai integer, bukan truthy check ──
+      // parseInt() menangani kasus nilai string, null, undefined, NaN
+      const v = parseInt(p.violations, 10) || 0;
+
+      // ── BUG FIX 1 (lanjutan): Tampilkan nama & ID dengan fallback yang aman ──
+      const namaDisplay = (p.nama && p.nama.trim()) ? p.nama.trim() : '(Tanpa Nama)';
+      const idDisplay   = (p.id   && String(p.id).trim()) ? String(p.id).trim() : '—';
+
       const kelas  = p.kelas ? `<span class="meta-pill kelas">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
@@ -1271,8 +1294,8 @@
             <div class="peserta-info">
               <div class="avatar" style="background:${color}22;color:${color}">${getInitials(p.nama)}</div>
               <div>
-                <div class="peserta-name">${p.nama || 'Tanpa Nama'}</div>
-                <div class="peserta-id">${p.id || '—'}</div>
+                <div class="peserta-name">${namaDisplay}</div>
+                <div class="peserta-id">${idDisplay}</div>
               </div>
             </div>
           </td>
@@ -1312,7 +1335,7 @@
     const header = ['Nama', 'ID Peserta', 'Kelas', 'Ruangan', 'Status', 'Jumlah Pelanggaran', 'Terakhir Update'];
     const rows   = list.map(p => [
       p.nama || '', p.id || '', p.kelas || '—', p.ruangan || '—',
-      statusLabel(p.status), p.violations || 0,
+      statusLabel(p.status), parseInt(p.violations, 10) || 0,
       p.lastUpdate ? new Date(p.lastUpdate).toLocaleString('id-ID') : '—'
     ]);
     return bom + [header, ...rows]
@@ -1332,7 +1355,7 @@
     if (!list.length) { showToast('Tidak ada data peserta untuk didownload.', 'info'); return; }
     const data = list.map(p => ({
       nama: p.nama||'', id: p.id||'', kelas: p.kelas||'—', ruangan: p.ruangan||'—',
-      status: statusLabel(p.status), pelanggaran: p.violations||0,
+      status: statusLabel(p.status), pelanggaran: parseInt(p.violations, 10)||0,
       lastUpdate: p.lastUpdate ? new Date(p.lastUpdate).toLocaleString('id-ID') : null
     }));
     const json = JSON.stringify({ exportedAt: nowStr(), instance: FIREBASE_CONFIGS[selectedInstance]?.label, total: data.length, peserta: data }, null, 2);
@@ -1341,7 +1364,7 @@
   }
 
   function downloadTableViolationsOnly() {
-    const list = buildTableData(p => (p.violations || 0) > 0);
+    const list = buildTableData(p => (parseInt(p.violations, 10) || 0) > 0);
     if (!list.length) { showToast('Tidak ada peserta dengan pelanggaran.', 'info'); return; }
     triggerDownload(tableToCSV(list), `Pelanggaran_${filenameDate()}.csv`, 'text/csv;charset=utf-8;');
     showToast(`${list.length} data pelanggaran berhasil didownload.`, 'success');
@@ -1508,10 +1531,14 @@
     };
     const msg = msgMap[type] || 'status berubah.';
 
+    // Nama & ID untuk log — fallback aman
+    const namaLog = (peserta.nama && peserta.nama.trim()) ? peserta.nama.trim() : '(Tanpa Nama)';
+    const idLog   = (peserta.id   && String(peserta.id).trim()) ? String(peserta.id).trim() : '—';
+
     logHistory.unshift({
       waktu      : nowStr(),
-      nama       : peserta.nama    || 'Peserta',
-      id         : peserta.id      || '—',
+      nama       : namaLog,
+      id         : idLog,
       kelas      : peserta.kelas   || '—',
       ruangan    : peserta.ruangan || '—',
       jenis      : type === 'aman' ? 'Kembali' : type === 'tab' ? 'Buka Tab Lain' : type === 'keluar' ? 'Keluar Halaman' : 'Offline',
@@ -1526,10 +1553,10 @@
     div.className = `notif-item ${typeClass}`;
     div.innerHTML = `
       <div class="notif-header">
-        <span class="notif-name">${peserta.nama || 'Peserta'}</span>
+        <span class="notif-name">${namaLog}</span>
         <span class="notif-time">${time}</span>
       </div>
-      <div class="notif-msg">${peserta.nama || 'Peserta'} ${msg}</div>
+      <div class="notif-msg">${namaLog} ${msg}</div>
       ${metaInfo ? `<div class="notif-meta">${metaInfo}</div>` : ''}`;
     listEl.insertBefore(div, listEl.firstChild);
 
@@ -1537,7 +1564,7 @@
     if (logHistory.length > MAX_NOTIF) logHistory.splice(MAX_NOTIF);
 
     if (Notification.permission === 'granted' && type !== 'aman') {
-      new Notification(`⚠️ ${peserta.nama}`, { body: msg });
+      new Notification(`⚠️ ${namaLog}`, { body: msg });
     }
   }
 
