@@ -543,12 +543,14 @@
   .notif-item.tab     { background: var(--warn-dim); border: 1px solid rgba(251,191,36,0.2); }
   .notif-item.keluar  { background: var(--danger-dim); border: 1px solid rgba(248,113,113,0.2); }
   .notif-item.kembali { background: var(--accent-dim); border: 1px solid rgba(74,222,128,0.15); }
+  .notif-item.offline { background: rgba(100,116,139,0.1); border: 1px solid rgba(100,116,139,0.2); }
 
   .notif-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
   .notif-name { font-size: 12px; font-weight: 700; }
-  .notif-item.tab .notif-name     { color: var(--warn); }
-  .notif-item.keluar .notif-name  { color: var(--danger); }
+  .notif-item.tab     .notif-name { color: var(--warn); }
+  .notif-item.keluar  .notif-name { color: var(--danger); }
   .notif-item.kembali .notif-name { color: var(--accent); }
+  .notif-item.offline .notif-name { color: var(--muted); }
   .notif-time { font-family: var(--mono); font-size: 10px; color: var(--muted); }
   .notif-msg  { font-size: 12px; color: var(--muted); line-height: 1.4; }
   .notif-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 4px; opacity: 0.7; }
@@ -1013,6 +1015,7 @@
   let dbListener = null;
   let selectedInstance = null;
   let soundEnabled = true;
+  let isInitialLoad = true; // FIX: flag untuk skip notif saat load pertama
   const pesertaData = {};
   const avatarColors = ['#4ade80','#60a5fa','#f472b6','#fb923c','#a78bfa','#34d399','#f59e0b'];
   const MAX_NOTIF = 100;
@@ -1039,11 +1042,15 @@
   }
 
   function gantiInstance() {
+    // Lepas listener lama
     if (dbListener && db) {
       try { db.ref('ujian/peserta').off('value', dbListener); } catch(e) {}
+      dbListener = null;
     }
+    // Reset semua state
     Object.keys(pesertaData).forEach(k => delete pesertaData[k]);
     logHistory.length = 0;
+    isInitialLoad = true;
     resetFilter();
     renderTable();
     updateStats();
@@ -1076,40 +1083,63 @@
   }
 
   function listenToPeserta() {
+    isInitialLoad = true; // Reset flag setiap kali listener baru dipasang
     const ref = db.ref('ujian/peserta');
+
     dbListener = ref.on('value', (snapshot) => {
       const data = snapshot.val() || {};
 
+      // ── FIX 1: Kumpulkan semua data baru dulu, baru cek perubahan ──
+      // Ini mencegah kondisi race di mana pesertaData[id] belum terisi
+      // saat event pertama masuk, tapi sudah dipakai sebagai "prev"
+      const incoming = {};
       Object.keys(data).forEach(id => {
         const curr = data[id];
-
-        // ── BUG FIX 1: Skip peserta yang tidak punya nama DAN tidak punya ID ──
-        // Data sampah (node kosong atau hanya berisi field non-peserta) diabaikan
+        // Skip node sampah: harus punya setidaknya nama ATAU id peserta
         if (!curr || (!curr.nama && !curr.id)) return;
-
-        const prev = pesertaData[id];
-
-        // ── BUG FIX 2: Cek perubahan status dengan benar ──
-        // Hanya trigger notifikasi jika:
-        // - peserta sudah ada sebelumnya (bukan data baru saat load awal)
-        // - statusnya benar-benar berubah
-        // - status sebelumnya valid (bukan undefined dari load pertama)
-        if (prev && prev.status !== undefined && prev.status !== curr.status) {
-          addNotification(curr, curr.status);
-        }
-
-        // Simpan data SETELAH cek, bukan sebelumnya
-        pesertaData[id] = curr;
+        incoming[id] = curr;
       });
 
-      // Hapus peserta yang sudah tidak ada di Firebase
+      // ── FIX 2: Notifikasi hanya setelah load awal selesai ──
+      // isInitialLoad = true saat event pertama → hanya isi pesertaData, tidak notif
+      // Setelah itu, setiap perubahan status akan trigger notifikasi
+      if (!isInitialLoad) {
+        Object.keys(incoming).forEach(id => {
+          const curr = incoming[id];
+          const prev = pesertaData[id];
+
+          // Cek perubahan status:
+          // - Peserta sudah ada sebelumnya (bukan peserta baru yang baru join)
+          // - Status benar-benar berbeda
+          if (prev && prev.status !== undefined && prev.status !== curr.status) {
+            addNotification(curr, curr.status);
+          }
+          // Peserta baru yang join saat ujian berlangsung → tidak notif, hanya tambah ke tabel
+        });
+
+        // Cek peserta yang dihapus dari Firebase (hapus offline manual)
+        Object.keys(pesertaData).forEach(id => {
+          if (!incoming[id]) delete pesertaData[id];
+        });
+      } else {
+        // Load pertama: hapus semua cache lama, isi fresh dari Firebase
+        Object.keys(pesertaData).forEach(k => delete pesertaData[k]);
+        isInitialLoad = false;
+      }
+
+      // Salin semua data incoming ke pesertaData
+      Object.assign(pesertaData, incoming);
+      // Hapus peserta yang sudah tidak ada di incoming
       Object.keys(pesertaData).forEach(id => {
-        if (!data[id]) delete pesertaData[id];
+        if (!incoming[id]) delete pesertaData[id];
       });
 
       renderFilterChips();
       renderTable();
       updateStats();
+    }, (error) => {
+      console.error('Firebase listener error:', error);
+      showToast('Koneksi Firebase terputus. Mencoba reconnect...', 'error');
     });
   }
 
@@ -1144,13 +1174,17 @@
     return map[status] || status;
   }
 
+  // FIX 3: Typo "d lalu" diperbaiki jadi "detik lalu"
+  // Juga ditambah penanganan timestamp yang belum ada / tidak valid
   function timeAgo(ts) {
     if (!ts) return '—';
     const diff = Math.floor((Date.now() - ts) / 1000);
+    if (diff < 0)    return 'Baru saja';
     if (diff < 5)    return 'Baru saja';
-    if (diff < 60)   return `${diff}d lalu`;
-    if (diff < 3600) return `${Math.floor(diff/60)}m lalu`;
-    return new Date(ts).toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit'});
+    if (diff < 60)   return `${diff} detik lalu`;   // FIX: was "${diff}d lalu"
+    if (diff < 3600) return `${Math.floor(diff / 60)} menit lalu`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} jam lalu`;
+    return new Date(ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
   }
 
   function nowStr() {
@@ -1182,7 +1216,7 @@
       ? `<span style="font-family:var(--mono);font-size:11px;color:var(--muted);font-style:italic">Belum ada data</span>`
       : kelasList.map(k => `
           <button class="filter-chip ${activeFilters.kelas === k ? 'active-purple' : ''}"
-            data-type="kelas" data-value="${k}" onclick="toggleFilter('kelas','${k}')">
+            data-type="kelas" data-value="${k}" onclick="toggleFilter('kelas','${encodeURIComponent(k)}')">
             <span class="filter-dot" style="color:var(--purple)"></span>${k}
           </button>`).join('');
 
@@ -1199,6 +1233,12 @@
   function toggleFilter(type, rawValue) {
     const value = decodeURIComponent(rawValue);
     activeFilters[type] = activeFilters[type] === value ? null : value;
+    // Sync tombol status
+    if (type === 'status') {
+      document.querySelectorAll('[data-type="status"]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.value === activeFilters.status);
+      });
+    }
     renderFilterChips();
     renderTable();
     updateFilterUI();
@@ -1264,30 +1304,36 @@
       return;
     }
 
+    // Urutan: keluar → tab → aman → selesai → offline
     const order = { keluar: 0, tab: 1, aman: 2, selesai: 3, offline: 4 };
-    filteredList.sort((a, b) => (order[a.status]||5) - (order[b.status]||5));
+    filteredList.sort((a, b) => (order[a.status] ?? 5) - (order[b.status] ?? 5));
 
     tbody.innerHTML = filteredList.map(p => {
-      const color  = getAvatarColor(p.id || p.nama || '?');
-
-      // ── BUG FIX 3: Parse violations sebagai integer, bukan truthy check ──
-      // parseInt() menangani kasus nilai string, null, undefined, NaN
-      const v = parseInt(p.violations, 10) || 0;
-
-      // ── BUG FIX 1 (lanjutan): Tampilkan nama & ID dengan fallback yang aman ──
+      const color = getAvatarColor(p.id || p.nama || '?');
+      const v     = parseInt(p.violations, 10) || 0;
       const namaDisplay = (p.nama && p.nama.trim()) ? p.nama.trim() : '(Tanpa Nama)';
       const idDisplay   = (p.id   && String(p.id).trim()) ? String(p.id).trim() : '—';
 
-      const kelas  = p.kelas ? `<span class="meta-pill kelas">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
-          <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
-        </svg>${p.kelas}</span>` : '<span style="color:var(--muted);font-size:11px;">—</span>';
-      const ruangan = p.ruangan ? `<span class="meta-pill ruangan">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-          <polyline points="9 22 9 12 15 12 15 22"/>
-        </svg>${p.ruangan}</span>` : '';
+      const kelas = p.kelas
+        ? `<span class="meta-pill kelas">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+            </svg>${p.kelas}</span>`
+        : '<span style="color:var(--muted);font-size:11px;">—</span>';
+
+      const ruangan = p.ruangan
+        ? `<span class="meta-pill ruangan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              <polyline points="9 22 9 12 15 12 15 22"/>
+            </svg>${p.ruangan}</span>`
+        : '';
+
+      // FIX 4: Gunakan lastUpdate yang ada di data Firebase secara langsung
+      // untuk memastikan waktu yang ditampilkan selalu sinkron dengan data terbaru
+      const updateTime = p.lastUpdate ? timeAgo(p.lastUpdate) : '—';
+
       return `
         <tr class="peserta-row">
           <td>
@@ -1302,7 +1348,7 @@
           <td><div style="display:flex;flex-wrap:wrap;gap:2px;align-items:center">${kelas}${ruangan}</div></td>
           <td>${statusPill(p.status)}</td>
           <td><div class="violation-count ${v > 0 ? 'has-violations' : ''}">${v > 0 ? v + '×' : '—'}</div></td>
-          <td><div class="time-cell">${timeAgo(p.lastUpdate)}</div></td>
+          <td><div class="time-cell">${updateTime}</div></td>
         </tr>`;
     }).join('');
 
@@ -1358,7 +1404,12 @@
       status: statusLabel(p.status), pelanggaran: parseInt(p.violations, 10)||0,
       lastUpdate: p.lastUpdate ? new Date(p.lastUpdate).toLocaleString('id-ID') : null
     }));
-    const json = JSON.stringify({ exportedAt: nowStr(), instance: FIREBASE_CONFIGS[selectedInstance]?.label, total: data.length, peserta: data }, null, 2);
+    const json = JSON.stringify({
+      exportedAt: nowStr(),
+      instance: FIREBASE_CONFIGS[selectedInstance]?.label,
+      total: data.length,
+      peserta: data
+    }, null, 2);
     triggerDownload(json, `Tabel_Peserta_${filenameDate()}.json`, 'application/json');
     showToast(`${list.length} data peserta berhasil didownload sebagai JSON.`, 'success');
   }
@@ -1515,6 +1566,8 @@
 
   /* ══════════════════════════════════════════
      NOTIFIKASI
+     FIX 5: Ditambah class "offline" pada notif item
+             dan penanganan semua jenis status
   ══════════════════════════════════════════ */
   function addNotification(peserta, type) {
     const listEl = document.getElementById('notifList');
@@ -1524,14 +1577,14 @@
     if (soundEnabled) playBeep(type);
 
     const msgMap = {
-      tab:    'membuka tab/window lain saat ujian berlangsung.',
-      keluar: 'keluar dari halaman ujian!',
-      aman:   'kembali ke halaman ujian.',
-      offline:'terputus dari jaringan.',
+      tab:     'membuka tab atau window lain saat ujian berlangsung.',
+      keluar:  'keluar dari halaman ujian!',
+      aman:    'kembali ke halaman ujian.',
+      offline: 'terputus dari jaringan.',
+      selesai: 'telah menyelesaikan ujian.',
     };
     const msg = msgMap[type] || 'status berubah.';
 
-    // Nama & ID untuk log — fallback aman
     const namaLog = (peserta.nama && peserta.nama.trim()) ? peserta.nama.trim() : '(Tanpa Nama)';
     const idLog   = (peserta.id   && String(peserta.id).trim()) ? String(peserta.id).trim() : '—';
 
@@ -1541,12 +1594,19 @@
       id         : idLog,
       kelas      : peserta.kelas   || '—',
       ruangan    : peserta.ruangan || '—',
-      jenis      : type === 'aman' ? 'Kembali' : type === 'tab' ? 'Buka Tab Lain' : type === 'keluar' ? 'Keluar Halaman' : 'Offline',
+      jenis      : type === 'aman'    ? 'Kembali ke Halaman'
+                 : type === 'tab'     ? 'Buka Tab Lain'
+                 : type === 'keluar'  ? 'Keluar Halaman'
+                 : type === 'selesai' ? 'Selesai Ujian'
+                 : 'Offline',
       keterangan : msg
     });
 
+    // FIX 5: Map type ke class CSS yang benar
+    // 'aman' → 'kembali' (hijau), 'offline' → 'offline' (abu)
     const typeClass = type === 'aman' ? 'kembali' : type;
-    const time = new Date().toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+    const time = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const metaInfo = [peserta.kelas, peserta.ruangan].filter(Boolean).join(' · ');
 
     const div = document.createElement('div');
@@ -1574,9 +1634,12 @@
       const osc  = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain); gain.connect(ctx.destination);
-      osc.frequency.value = type === 'keluar' ? 440 : 600;
+      osc.frequency.value = type === 'keluar' ? 440 : type === 'offline' ? 350 : 600;
       gain.gain.value     = type === 'keluar' ? 0.3 : 0.2;
-      osc.start(); osc.stop(ctx.currentTime + (type === 'keluar' ? 0.4 : 0.2));
+      osc.start();
+      osc.stop(ctx.currentTime + (type === 'keluar' ? 0.4 : 0.2));
+      // Tutup AudioContext setelah selesai untuk cegah memory leak
+      osc.onended = () => { try { ctx.close(); } catch(e) {} };
     } catch(e) {}
   }
 
@@ -1587,17 +1650,40 @@
 
   /* ══════════════════════════════════════════
      CLOCK & INIT
+     FIX 6: Hapus setInterval(renderTable, 30000)
+             Firebase listener on('value') sudah
+             otomatis re-render saat ada perubahan.
+             Interval tidak diperlukan dan bisa
+             menyebabkan render dari cache stale.
   ══════════════════════════════════════════ */
   function updateClock() {
     document.getElementById('clock').textContent = new Date().toLocaleTimeString('id-ID');
+  }
+
+  // FIX 7: Refresh kolom "Update" setiap 30 detik agar timeAgo tetap akurat
+  // (misal: "5 detik lalu" → "35 detik lalu") TANPA re-fetch data dari Firebase
+  function refreshTimestamps() {
+    const timeCells = document.querySelectorAll('#pesertaBody .time-cell');
+    const rows = document.querySelectorAll('#pesertaBody .peserta-row');
+    const filteredList = getFilteredList();
+    const order = { keluar: 0, tab: 1, aman: 2, selesai: 3, offline: 4 };
+    filteredList.sort((a, b) => (order[a.status] ?? 5) - (order[b.status] ?? 5));
+    timeCells.forEach((cell, i) => {
+      const peserta = filteredList[i];
+      if (peserta && peserta.lastUpdate) {
+        cell.textContent = timeAgo(peserta.lastUpdate);
+      }
+    });
   }
 
   if ('Notification' in window && Notification.permission === 'default') {
     Notification.requestPermission();
   }
 
-  setInterval(renderTable, 30000);
+  // Hanya clock dan refresh timestamp yang pakai interval
+  // renderTable TIDAK dijalankan via interval — biarkan Firebase listener yang handle
   setInterval(updateClock, 1000);
+  setInterval(refreshTimestamps, 30000); // Refresh teks "X detik lalu" tanpa re-render penuh
   updateClock();
 </script>
 </body>
